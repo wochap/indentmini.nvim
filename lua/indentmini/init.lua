@@ -10,6 +10,7 @@ local opt = {
     ephemeral = true,
   },
 }
+local enabled = true
 
 ffi.cdef([[
   typedef struct {} Error;
@@ -164,6 +165,9 @@ local function find_current_range(currow_indent)
 end
 
 local function on_line(_, _, bufnr, row)
+  if not enabled then
+    return
+  end
   local sp = find_in_snapshot(row + 1)
   if sp.indent == 0 or out_current_range(row) then
     return
@@ -214,6 +218,7 @@ local function on_win(_, winid, bufnr, toprow, botrow)
     or vim.iter(opt.exclude):find(function(v)
       return v == vim.bo[bufnr].ft or v == vim.bo[bufnr].buftype
     end)
+    or not enabled
   then
     return false
   end
@@ -255,6 +260,13 @@ return {
     if opt.only_current and vim.opt.cursorline then
       local bg = api.nvim_get_hl(0, { name = 'CursorLine' }).bg
       api.nvim_set_hl(0, 'IndentLineCurHide', { fg = bg })
+    end
+  end,
+  toggle = function(state)
+    if state ~= nil then
+      enabled = state
+    else
+      enabled = not enabled
     end
   end,
 }
