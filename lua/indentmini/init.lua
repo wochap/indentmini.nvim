@@ -213,6 +213,10 @@ local function on_line(_, _, bufnr, row)
 end
 
 local function on_win(_, winid, bufnr, toprow, botrow)
+  local is_im_enabled_ok, is_im_enabled = pcall(vim.api.nvim_buf_get_var, bufnr, 'is_im_enabled')
+  if is_im_enabled_ok and not is_im_enabled then
+    return false
+  end
   if
     bufnr ~= api.nvim_get_current_buf()
     or vim.iter(opt.exclude):find(function(v)
@@ -268,5 +272,19 @@ return {
     else
       enabled = not enabled
     end
+  end,
+  toggle_buff = function(bufnr, state)
+    if bufnr == nil then
+      bufnr = 0
+    end
+    local is_im_enabled_ok, is_im_enabled = pcall(vim.api.nvim_buf_get_var, bufnr, 'is_im_enabled')
+    if state == nil then
+      if is_im_enabled_ok then
+        state = not is_im_enabled
+      else
+        state = false
+      end
+    end
+    vim.api.nvim_buf_set_var(bufnr, 'is_im_enabled', state)
   end,
 }
