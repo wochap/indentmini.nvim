@@ -246,7 +246,6 @@ local function on_win(_, winid, bufnr, toprow, botrow)
   for i = toprow, botrow do
     context.snapshot[i + 1] = make_snapshot(i + 1)
   end
-  api.nvim_win_set_hl_ns(winid, ns)
   context.leftcol = vim.fn.winsaveview().leftcol
   context.count = api.nvim_buf_line_count(bufnr)
   local pos = api.nvim_win_get_cursor(winid)
@@ -278,6 +277,7 @@ return {
     else
       enabled = not enabled
     end
+    vim.cmd('redraw!')
   end,
   toggle_buff = function(bufnr, state)
     if bufnr == nil then
@@ -292,6 +292,7 @@ return {
       end
     end
     vim.api.nvim_buf_set_var(bufnr, 'is_im_enabled', state)
+    vim.cmd('redraw!')
   end,
   toggle_win = function(winid, state)
     if winid == nil then
@@ -306,5 +307,6 @@ return {
       end
     end
     vim.api.nvim_win_set_var(winid, 'is_im_enabled', state)
+    vim.cmd('redraw!')
   end,
 }
