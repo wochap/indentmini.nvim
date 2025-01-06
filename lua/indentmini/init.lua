@@ -3,12 +3,14 @@ local buf_set_extmark, set_provider = api.nvim_buf_set_extmark, api.nvim_set_dec
 local ns = api.nvim_create_namespace('IndentLine')
 local ffi = require('ffi')
 local opt = {
+  only_current = false,
   config = {
     virt_text_pos = 'overlay',
     hl_mode = 'combine',
     ephemeral = true,
   },
 }
+local enabled = true
 
 ffi.cdef([[
   typedef struct {} Error;
@@ -20,131 +22,291 @@ ffi.cdef([[
   typedef int32_t linenr_T;
   int get_indent_lnum(linenr_T lnum);
   char *ml_get(linenr_T lnum);
-  colnr_T ml_get_len(linenr_T lnum);
-  size_t strlen(const char *__s);
 ]])
-
 local C = ffi.C
-local ml_get, ml_get_len = C.ml_get, C.ml_get_len
+local ml_get = C.ml_get
 local find_buffer_by_handle = C.find_buffer_by_handle
 local get_sw_value, get_indent_lnum = C.get_sw_value, C.get_indent_lnum
-local cache = { snapshot = {} }
 
-local function line_is_empty(lnum)
-  return tonumber(ml_get_len(lnum)) == 0
+--- @class Snapshot
+--- @field indent? integer
+--- @field is_empty? boolean
+--- @field is_tab? boolean
+--- @field indent_cols? integer
+--- @field line_text? string
+
+--- @class Context
+--- @field snapshot table<integer, Snapshot>
+--- @field changedtick integer
+--- @field wrap_state? table
+local context = { snapshot = {}, changedtick = INVALID }
+
+--- check text only has space or tab see bench/space_or_tab.lua
+--- @param text string
+--- @return boolean true only have space or tab
+local function only_spaces_or_tabs(text)
+  for i = 1, #text do
+    local byte = string.byte(text, i)
+    if byte ~= 32 and byte ~= 9 then -- 32 is space, 9 is tab
+      return false
+    end
+  end
+  return true
 end
 
+--- @param bufnr integer
+--- @return integer the shiftwidth value of bufnr
 local function get_shiftw_value(bufnr)
   local handle = find_buffer_by_handle(bufnr, ffi.new('Error'))
   return get_sw_value(handle)
 end
 
-local function non_or_space(line, col)
-  local text = line:sub(col, col)
-  return text and (#text == 0 or text == ' ' or text == '\t') or false
+--- store the line data in snapshot and update the blank line indent
+--- @param lnum integer
+--- @return Snapshot
+local function make_snapshot(lnum)
+  local line_text = ffi.string(ml_get(lnum))
+  local is_empty = #line_text == 0 or only_spaces_or_tabs(line_text)
+  local indent = is_empty and 0 or get_indent_lnum(lnum)
+  if is_empty then
+    local prev_lnum = lnum - 1
+    while prev_lnum >= 1 do
+      local sp = context.snapshot[prev_lnum] or make_snapshot(prev_lnum)
+      if (not sp.is_empty and sp.indent == 0) or (sp.indent > 0) then
+        if sp.indent > 0 then
+          indent = sp.indent
+        end
+        break
+      end
+      prev_lnum = prev_lnum - 1
+    end
+  end
+
+  local prev = context.snapshot[lnum - 1]
+  if prev and prev.is_empty and prev.indent < indent then
+    local prev_lnum = lnum - 1
+    while prev_lnum >= 1 do
+      local sp = context.snapshot[prev_lnum]
+      if not sp or not sp.is_empty or sp.indent >= indent then
+        break
+      end
+      sp.indent = indent
+      sp.indent_cols = indent
+      prev_lnum = prev_lnum - 1
+    end
+  end
+  local indent_cols = line_text:find('[^ \t]')
+  indent_cols = indent_cols and indent_cols - 1 or INVALID
+  if is_empty then
+    indent_cols = indent
+  end
+  local snapshot = {
+    indent = indent,
+    is_empty = is_empty,
+    indent_cols = indent_cols,
+  }
+
+  context.snapshot[lnum] = snapshot
+  return snapshot
 end
 
+--- @param lnum integer
+--- @return Snapshot
 local function find_in_snapshot(lnum)
-  cache.snapshot[lnum] = cache.snapshot[lnum] or { get_indent_lnum(lnum), line_is_empty(lnum) }
-  return unpack(cache.snapshot[lnum])
+  context.snapshot[lnum] = context.snapshot[lnum] or make_snapshot(lnum)
+  return context.snapshot[lnum]
 end
 
-local function find_row(row, curindent, direction, render)
-  local target_row = row + direction
-  while true do
-    if target_row < 0 or target_row > cache.count - 1 then
-      return INVALID
+--- @param row integer
+--- @param direction integer UP or DOWN
+--- @return integer
+--- @return integer
+local function range_in_snapshot(row, direction, fn)
+  while row >= 0 and row < context.count do
+    local sp = find_in_snapshot(row + 1)
+    if fn(sp.indent, sp.is_empty, row) then
+      return sp.indent, row
     end
-    local target_indent, empty = find_in_snapshot(target_row + 1)
-    if empty == nil then
-      return INVALID
-    end
-    if target_indent == 0 and not empty and render then
-      break
-    elseif not empty and (render and target_indent > curindent or target_indent < curindent) then
-      return target_row
-    end
-    target_row = target_row + direction
+    row = row + direction
   end
-  return INVALID
+  return INVALID, INVALID
 end
 
-local function current_line_range(winid, step)
-  local row = api.nvim_win_get_cursor(winid)[1] - 1
-  local indent, _ = find_in_snapshot(row + 1)
-  if indent == 0 then
-    return INVALID, INVALID, INVALID
+local function out_current_range(row)
+  return opt.only_current
+    and context.range_srow
+    and context.range_erow
+    and (row < context.range_srow or row > context.range_erow)
+end
+
+local function find_current_range(currow_indent)
+  local curlevel = math.ceil(currow_indent / context.tabstop) -- for mixup
+  local range_fn = function(indent, empty, row)
+    local level = math.ceil(indent / context.tabstop)
+    if
+      ((not empty and not context.mixup) and indent < currow_indent)
+      or (context.mixup and level < curlevel)
+    then
+      if row < context.currow then
+        context.range_srow = row
+      else
+        context.range_erow = row
+      end
+      return true
+    end
   end
-  local top_row = find_row(row, indent, UP, false)
-  local bot_row = find_row(row, indent, DOWN, false)
-  return top_row, bot_row, math.floor(indent / step)
+  range_in_snapshot(context.currow - 1, UP, range_fn)
+  range_in_snapshot(context.currow + 1, DOWN, range_fn)
+  if context.range_srow and not context.range_erow then
+    context.range_erow = context.count - 1
+  end
+  context.cur_inlevel = context.mixup and math.ceil(currow_indent / context.tabstop)
+    or math.floor(currow_indent / context.step)
 end
 
 local function on_line(_, _, bufnr, row)
-  local indent, is_empty = find_in_snapshot(row + 1)
-  if is_empty == nil then
+  if not enabled then
     return
   end
-  local top_row, bot_row
-  if indent == 0 and is_empty then
-    top_row = find_row(row, indent, UP, true)
-    bot_row = find_row(row, indent, DOWN, true)
-    local top_indent = top_row >= 0 and find_in_snapshot(top_row + 1) or 0
-    local bot_indent = bot_row >= 0 and find_in_snapshot(bot_row + 1) or 0
-    indent = math.max(top_indent, bot_indent)
+  local sp = find_in_snapshot(row + 1)
+  if sp.indent == 0 or out_current_range(row) then
+    return
   end
-  local line = ffi.string(ml_get(row + 1))
-  for i = 1, indent - 1, cache.step do
+  if context.wrap_state[row] ~= nil then
+    context.wrap_state[row] = true
+  end
+  local currow_insert = api.nvim_get_mode().mode == 'i' and context.currow == row
+  -- mixup like vim code has modeline vi:set ts=8 sts=4 sw=4 noet:
+  -- 4 8 12 16 20 24
+  -- 1 1 2  2  3  3
+  local total = context.mixup and math.ceil(sp.indent / context.tabstop) or sp.indent - 1
+  local step = context.mixup and 1 or context.step
+  for i = 1, total, step do
     local col = i - 1
-    local level = math.floor(col / cache.step) + 1
-    if level < opt.minlevel then
-      goto continue
-    end
-    local higroup = 'IndentLine'
-    if row > cache.reg_srow and row < cache.reg_erow and level == cache.cur_inlevel then
-      higroup = 'IndentLineCurrent'
-    end
-    if not vim.o.expandtab or line:find('^\t') then
+    local level = context.mixup and i or math.floor(col / context.step) + 1
+    if context.is_tab and not context.mixup then
       col = level - 1
     end
-    if col >= cache.leftcol and non_or_space(line, col + 1) then
+    if
+      col >= context.leftcol
+      and level >= opt.minlevel
+      and (not opt.only_current or level == context.cur_inlevel)
+      and col < sp.indent_cols
+      and (not currow_insert or col ~= context.curcol)
+    then
+      local row_in_curblock = context.range_srow
+        and (row > context.range_srow and row < context.range_erow)
+      local higroup = row_in_curblock and level == context.cur_inlevel and 'IndentLineCurrent'
+        or 'IndentLine'
+      if opt.only_current and row_in_curblock and level ~= context.cur_inlevel then
+        higroup = 'IndentLineCurHide'
+      end
       opt.config.virt_text[1][2] = higroup
-      if is_empty and col > 0 then
-        opt.config.virt_text_win_col = i - 1 - cache.leftcol
+      if sp.is_empty and col > 0 then
+        opt.config.virt_text_win_col = not context.mixup and i - 1 - context.leftcol
+          or (i - 1) * context.tabstop
       end
       buf_set_extmark(bufnr, ns, row, col, opt.config)
       opt.config.virt_text_win_col = nil
     end
-    ::continue::
   end
 end
 
 local function on_win(_, winid, bufnr, toprow, botrow)
+  local is_win_im_enabled_ok, is_win_im_enabled =
+    pcall(vim.api.nvim_win_get_var, winid, 'is_im_enabled')
+  if is_win_im_enabled_ok and not is_win_im_enabled then
+    return false
+  end
+  local is_buff_im_enabled_ok, is_buff_im_enabled =
+    pcall(vim.api.nvim_buf_get_var, bufnr, 'is_im_enabled')
+  if is_buff_im_enabled_ok and not is_buff_im_enabled then
+    return false
+  end
   if
     bufnr ~= api.nvim_get_current_buf()
     or vim.iter(opt.exclude):find(function(v)
       return v == vim.bo[bufnr].ft or v == vim.bo[bufnr].buftype
     end)
+    or not enabled
   then
     return false
   end
-  api.nvim_win_set_hl_ns(winid, ns)
-  cache.leftcol = vim.fn.winsaveview().leftcol
-  cache.step = vim.o.expandtab and get_shiftw_value(bufnr) or vim.bo[bufnr].tabstop
-  cache.count = api.nvim_buf_line_count(bufnr)
-  cache.reg_srow, cache.reg_erow, cache.cur_inlevel = current_line_range(winid, cache.step)
-  for i = toprow, botrow do
-    cache.snapshot[i + 1] = { get_indent_lnum(i + 1), line_is_empty(i + 1) }
+  opt.config.virt_text_repeat_linebreak = vim.wo[winid].wrap and vim.wo[winid].breakindent
+  local changedtick = api.nvim_buf_get_changedtick(bufnr)
+  if changedtick ~= context.changedtick then
+    context = { snapshot = {}, changedtick = changedtick }
   end
+  context.is_tab = not vim.bo[bufnr].expandtab
+  context.step = get_shiftw_value(bufnr)
+  context.tabstop = vim.bo[bufnr].tabstop
+  context.softtabstop = vim.bo[bufnr].softtabstop
+  context.win_width = api.nvim_win_get_width(winid)
+  context.mixup = context.is_tab and context.tabstop > context.softtabstop
+  for i = toprow, botrow do
+    context.snapshot[i + 1] = make_snapshot(i + 1)
+  end
+  context.leftcol = vim.fn.winsaveview().leftcol
+  context.count = api.nvim_buf_line_count(bufnr)
+  local pos = api.nvim_win_get_cursor(winid)
+  context.currow = pos[1] - 1
+  context.curcol = pos[2]
+  context.botrow = botrow
+  context.wrap_state = {}
+  local currow_indent = find_in_snapshot(context.currow + 1).indent
+  find_current_range(currow_indent)
 end
 
 return {
   setup = function(conf)
     conf = conf or {}
-    opt.exclude = { 'dashboard', 'lazy', 'help', 'markdown', 'nofile', 'terminal', 'prompt' }
+    opt.only_current = conf.only_current or false
+    opt.exclude = { 'dashboard', 'lazy', 'help', 'nofile', 'terminal', 'prompt' }
     vim.list_extend(opt.exclude, conf.exclude or {})
     opt.config.virt_text = { { conf.char or '│' } }
     opt.minlevel = conf.minlevel or 1
     set_provider(ns, { on_win = on_win, on_line = on_line })
+    if opt.only_current and vim.opt.cursorline then
+      local bg = api.nvim_get_hl(0, { name = 'CursorLine' }).bg
+      api.nvim_set_hl(0, 'IndentLineCurHide', { fg = bg })
+    end
+  end,
+  toggle = function(state)
+    if state ~= nil then
+      enabled = state
+    else
+      enabled = not enabled
+    end
+    vim.cmd('redraw!')
+  end,
+  toggle_buff = function(bufnr, state)
+    if bufnr == nil then
+      bufnr = 0
+    end
+    local is_im_enabled_ok, is_im_enabled = pcall(vim.api.nvim_buf_get_var, bufnr, 'is_im_enabled')
+    if state == nil then
+      if is_im_enabled_ok then
+        state = not is_im_enabled
+      else
+        state = false
+      end
+    end
+    vim.api.nvim_buf_set_var(bufnr, 'is_im_enabled', state)
+    vim.cmd('redraw!')
+  end,
+  toggle_win = function(winid, state)
+    if winid == nil then
+      winid = 0
+    end
+    local is_im_enabled_ok, is_im_enabled = pcall(vim.api.nvim_win_get_var, winid, 'is_im_enabled')
+    if state == nil then
+      if is_im_enabled_ok then
+        state = not is_im_enabled
+      else
+        state = false
+      end
+    end
+    vim.api.nvim_win_set_var(winid, 'is_im_enabled', state)
+    vim.cmd('redraw!')
   end,
 }
